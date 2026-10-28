@@ -407,7 +407,7 @@ function goTo(id) {
 const hoje = () => new Date().toISOString().slice(0,10);
 function fmtData(s){const[y,m,d]=s.split('-');return`${d}/${m}`}
 function fmtMin(m){const h=Math.floor(m/60),r=m%60;return h>0?`${h}h${r>0?r+'m':''}`:`${r}m`}
-function salvar(){localStorage.setItem(KEY,JSON.stringify(dados))}
+function salvar(){try{localStorage.setItem(KEY,JSON.stringify(dados));return true;}catch(e){toast('⚠️ Não foi possível salvar. Abra pelo Safari (não no modo privado).','#E53935');return false;}}
 function inicioSemana(offset=0){
   const d=new Date();d.setDate(d.getDate()+offset*7);
   const day=d.getDay();const diff=d.getDate()-day+(day===0?-6:1);
@@ -458,52 +458,122 @@ function limparDados(){
 // ── POMODORO ────────────────────────────────────────────
 let pomoAtivo=false, pomoInterval=null, pomoSegsTotal=25*60, pomoSegsRestantes=25*60;
 let pomoTipoAtual='Foco', pomoCiclos=0, pomoMateria=null;
+let pomoFimTs=null; // timestamp de término do bloco atual (tempo real)
+const KEY_POMO='estudos_pomo_v1'; // estado persistente do pomodoro
+
+// Salva o estado do pomodoro para sobreviver ao fechamento da página no iOS
+function pomoSalvaEstado(){
+  try{
+    localStorage.setItem(KEY_POMO,JSON.stringify({
+      ativo:pomoAtivo, fimTs:pomoFimTs, total:pomoSegsTotal,
+      tipo:pomoTipoAtual, materia:pomoMateria, ciclos:pomoCiclos,
+      restantes:pomoSegsRestantes, diaCiclos:hoje()
+    }));
+  }catch(e){}
+}
+
+// Restaura o estado ao abrir a página (recalcula pelo tempo real)
+function pomoRestauraEstado(){
+  let s;try{s=JSON.parse(localStorage.getItem(KEY_POMO));}catch(e){return;}
+  if(!s)return;
+  // zera contagem de ciclos se virou o dia
+  pomoCiclos = (s.diaCiclos===hoje()) ? (s.ciclos||0) : 0;
+  pomoSegsTotal=s.total||25*60;
+  pomoTipoAtual=s.tipo||'Foco';
+  pomoMateria=s.materia||null;
+  // marca visualmente o modo e a matéria salvos
+  document.querySelectorAll('.pomo-modo').forEach(b=>{
+    b.classList.toggle('ativo', parseInt(b.dataset.min)===pomoSegsTotal/60);
+  });
+  if(pomoMateria){
+    document.querySelectorAll('#pomoMatBtns .mat-btn').forEach(b=>{
+      if(b.dataset.key===pomoMateria){b.classList.add('sel');b.style.background=MATERIAS[pomoMateria].cor;}
+    });
+  }
+  if(s.ativo && s.fimTs){
+    // estava rodando: retoma pelo tempo real
+    pomoFimTs=s.fimTs;
+    const restam=Math.round((pomoFimTs-Date.now())/1000);
+    if(restam<=0){
+      // o bloco já venceu enquanto estava fechado: finaliza agora
+      pomoSegsRestantes=0;pomoAtivo=true;pomoFinaliza();
+    }else{
+      pomoSegsRestantes=restam;pomoAtivo=true;
+      document.getElementById('pomoBtnPlay').textContent='⏸ Pausar';
+      clearInterval(pomoInterval);pomoInterval=setInterval(pomoSincroniza,1000);
+    }
+  }else{
+    pomoSegsRestantes=(s.restantes!=null)?s.restantes:pomoSegsTotal;
+  }
+  atualizarPomoUI();
+}
 
 function setModo(btn, tipo, minutos){
   document.querySelectorAll('.pomo-modo').forEach(b=>b.classList.remove('ativo'));
   btn.classList.add('ativo');
   pomoTipoAtual=tipo; pomoSegsTotal=minutos*60; pomoSegsRestantes=minutos*60;
-  if(pomoAtivo){clearInterval(pomoInterval);pomoAtivo=false;}
+  if(pomoAtivo){clearInterval(pomoInterval);pomoInterval=null;pomoAtivo=false;pomoFimTs=null;}
   document.getElementById('pomoBtnPlay').textContent='▶ Iniciar';
+  pomoSalvaEstado();
   atualizarPomoUI();
+}
+
+// Recalcula os segundos restantes a partir do horário real de término.
+// Não depende do tick: mesmo se o navegador suspender o timer em 2º plano,
+// ao voltar os segundos são recalculados pela diferença de tempo real.
+function pomoSincroniza(){
+  if(!pomoAtivo||pomoFimTs===null)return;
+  pomoSegsRestantes=Math.max(0,Math.round((pomoFimTs-Date.now())/1000));
+  atualizarPomoUI();
+  if(pomoSegsRestantes<=0)pomoFinaliza();
+}
+
+function pomoFinaliza(){
+  clearInterval(pomoInterval);pomoInterval=null;pomoAtivo=false;pomoFimTs=null;
+  pomoSegsRestantes=0;atualizarPomoUI();
+  document.getElementById('pomoBtnPlay').textContent='▶ Iniciar';
+  pomoSalvaEstado();
+  if(pomoTipoAtual==='Foco'){
+    pomoCiclos++;
+    if(pomoMateria){
+      dados.push({data:hoje(),minutos:pomoSegsTotal/60,materia:pomoMateria,nota:'🍅 Pomodoro automático',humor:null,ts:Date.now()});
+      salvar();
+    }
+    toast(`🍅 Pomodoro concluído! ${pomoCiclos} ciclo${pomoCiclos>1?'s':''} hoje`,'#1E88E5');
+    if(Notification.permission==='granted')new Notification('🍅 Pomodoro concluído!',{body:`${pomoCiclos} ciclo${pomoCiclos>1?'s':''} de foco hoje.`});
+  } else {
+    toast('☕ Pausa encerrada! Hora de voltar.','#FF6F00');
+  }
+  // Som curto para avisar mesmo com a tela desperta mas sem olhar
+  try{const a=new (window.AudioContext||window.webkitAudioContext)();const o=a.createOscillator();const g=a.createGain();o.connect(g);g.connect(a.destination);o.frequency.value=880;g.gain.value=0.1;o.start();setTimeout(()=>{o.stop();a.close();},350);}catch(e){}
+  renderCiclos();renderizar();
 }
 
 function togglePomodoro(){
   if(!pomoAtivo){
     pomoAtivo=true;
+    pomoFimTs=Date.now()+pomoSegsRestantes*1000; // ancora no tempo real
     document.getElementById('pomoBtnPlay').textContent='⏸ Pausar';
-    pomoInterval=setInterval(()=>{
-      pomoSegsRestantes--;
-      atualizarPomoUI();
-      if(pomoSegsRestantes<=0){
-        clearInterval(pomoInterval);pomoAtivo=false;
-        document.getElementById('pomoBtnPlay').textContent='▶ Iniciar';
-        if(pomoTipoAtual==='Foco'){
-          pomoCiclos++;
-          // Registrar automaticamente
-          if(pomoMateria){
-            dados.push({data:hoje(),minutos:pomoSegsTotal/60,materia:pomoMateria,nota:'🍅 Pomodoro automático',humor:null,ts:Date.now()});
-            salvar();
-          }
-          toast(`🍅 Pomodoro concluído! ${pomoCiclos} ciclo${pomoCiclos>1?'s':''} hoje`,'#1E88E5');
-          if(Notification.permission==='granted')new Notification('🍅 Pomodoro concluído!',{body:`${pomoCiclos} ciclo${pomoCiclos>1?'s':''} de foco hoje.`});
-        } else {
-          toast('☕ Pausa encerrada! Hora de voltar.','#FF6F00');
-        }
-        renderCiclos();
-        renderizar();
-      }
-    },1000);
+    clearInterval(pomoInterval);
+    pomoInterval=setInterval(pomoSincroniza,1000);
+    pomoSalvaEstado();
+    pomoSincroniza();
   } else {
-    clearInterval(pomoInterval);pomoAtivo=false;
+    // Pausar: congela os segundos restantes
+    clearInterval(pomoInterval);pomoInterval=null;pomoAtivo=false;
+    if(pomoFimTs!==null)pomoSegsRestantes=Math.max(0,Math.round((pomoFimTs-Date.now())/1000));
+    pomoFimTs=null;
     document.getElementById('pomoBtnPlay').textContent='▶ Iniciar';
+    pomoSalvaEstado();
+    atualizarPomoUI();
   }
 }
 
 function resetPomodoro(){
-  clearInterval(pomoInterval);pomoAtivo=false;
+  clearInterval(pomoInterval);pomoInterval=null;pomoAtivo=false;pomoFimTs=null;
   pomoSegsRestantes=pomoSegsTotal;
   document.getElementById('pomoBtnPlay').textContent='▶ Iniciar';
+  pomoSalvaEstado();
   atualizarPomoUI();
 }
 
@@ -785,10 +855,20 @@ function verificarMetaEmTempo(){
   },60000);
 }
 
+// Ao voltar o foco/aba: se a página seguiu viva, só ressincroniza;
+// se o iOS descarregou a página, o reload chama pomoRestauraEstado no INIT.
+function pomoAoVoltar(){
+  if(pomoAtivo){pomoSincroniza();}
+  else{pomoRestauraEstado();}
+}
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)pomoAoVoltar();});
+window.addEventListener('focus',pomoAoVoltar);
+window.addEventListener('pageshow',pomoAoVoltar);
+
 // ── INIT ────────────────────────────────────────────────
 document.getElementById('inputData').value=hoje();
 carregarCfgAlertas();renderInstrucao();agendarNotificacoes();
-verificarMetaEmTempo();atualizarPomoUI();renderCiclos();renderizar();
+verificarMetaEmTempo();pomoRestauraEstado();atualizarPomoUI();renderCiclos();renderizar();
 </script>
 </body>
 </html>
